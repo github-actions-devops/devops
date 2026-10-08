@@ -1,5 +1,3 @@
-name: TruffleHog Secrets Scan
-
 on:
   pull_request:
     branches:
@@ -7,7 +5,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   trufflehog:
@@ -15,32 +12,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout PR head
+      - name: Checkout PR
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # Check out the actual PR branch tip, not the synthetic merge commit.
-          # This ensures HEAD == PR head commit, so --branch HEAD is unambiguous.
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Install TruffleHog
         run: |
           curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
             | sh -s -- -b /usr/local/bin
-          trufflehog --version
 
-      - name: Verify commit range
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          echo "Base : $BASE_SHA"
-          echo "Head : $(git rev-parse HEAD)"
-          echo ""
-          echo "Commits that will be scanned:"
-          # This must list your PR commits — if it is empty the scan finds nothing
-          git log --oneline "$BASE_SHA..HEAD"
-
-      - name: Scan PR commits
+      - name: Scan PR
         id: scan
         shell: bash
         env:
@@ -51,52 +34,35 @@ jobs:
           trufflehog git "file://$(pwd)" \
             --since-commit="$BASE_SHA" \
             --branch="HEAD" \
+            --results=verified,unverified,unknown \
             --json \
             --fail \
             --no-update \
-            > trufflehog_report.json \
-            2> trufflehog_stderr.log   # <-- stderr separated; never mixed with JSON
+            > trufflehog_report.json 2> trufflehog_stderr.log
 
           exit_code=$?
 
-          # Always surface TruffleHog's own log output for debugging
-          if [ -s trufflehog_stderr.log ]; then
-            echo "--- TruffleHog runtime log ---"
+          if [ "$exit_code" -eq 183 ]; then
+            echo "secrets_found=true" >> "$GITHUB_OUTPUT"
+
+            echo "::error::Secrets detected!"
+
+            jq -r '
+              "Detector: \(.DetectorName // "Unknown") | File: \(.SourceMetadata.Data.Git.file // "unknown") | Line: \(.SourceMetadata.Data.Git.line // "unknown") | Commit: \((.SourceMetadata.Data.Git.commit // "unknown")[0:8])"
+            ' trufflehog_report.json
+
+          elif [ "$exit_code" -eq 0 ]; then
+            echo "secrets_found=false" >> "$GITHUB_OUTPUT"
+            echo "No secrets detected."
+
+          else
+            echo "secrets_found=error" >> "$GITHUB_OUTPUT"
             cat trufflehog_stderr.log
-            echo "------------------------------"
           fi
-
-          echo "TruffleHog exit code: $exit_code"
-
-          case "$exit_code" in
-            183)
-              echo "secrets_found=true" >> "$GITHUB_OUTPUT"
-
-              echo "::error::Secrets detected in this PR!"
-              echo ""
-              echo "--- Findings ---"
-              # trufflehog_report.json is now clean NDJSON — one JSON object per line
-              jq -r '
-                "Detector : " + (.DetectorName                         // "Unknown") +
-                " | Verified: " + (.Verified                          // false | tostring) +
-                " | File   : " + (.SourceMetadata.Data.Git.file       // "unknown") +
-                " | Line   : " + (.SourceMetadata.Data.Git.line       // "unknown" | tostring) +
-                " | Commit : " + ((.SourceMetadata.Data.Git.commit    // "unknown") | .[0:8])
-              ' trufflehog_report.json
-              ;;
-            0)
-              echo "secrets_found=false" >> "$GITHUB_OUTPUT"
-              echo "No secrets detected."
-              ;;
-            *)
-              echo "secrets_found=error" >> "$GITHUB_OUTPUT"
-              echo "::error::TruffleHog exited unexpectedly (code: $exit_code)"
-              ;;
-          esac
 
           exit 0
 
-      - name: Upload report artifacts
+      - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -107,14 +73,8 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
 
-      - name: Block merge — secrets found
-        if: steps.scan.outputs.secrets_found == 'true'
+      - name: Block merge
+        if: steps.scan.outputs.secrets_found != 'false'
         run: |
-          echo "::error::Secrets were detected. Remove them and push again."
-          exit 1
-
-      - name: Block merge — scan error
-        if: steps.scan.outputs.secrets_found == 'error'
-        run: |
-          echo "::error::TruffleHog exited with an unexpected error. Check the logs."
+          echo "::error::Secrets detected or scan failed."
           exit 1
