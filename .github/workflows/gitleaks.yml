@@ -2,8 +2,7 @@ name: Gitleaks Secret Scan
 
 on:
   pull_request:
-    branches:
-      - main
+    branches: [main]
 
 permissions:
   contents: read
@@ -29,17 +28,46 @@ jobs:
             | tar -xz -C /usr/local/bin gitleaks
 
       - name: Scan Secrets
+        id: scan
+        continue-on-error: true
         run: |
           gitleaks git . \
             --redact \
-            --report-format sarif \
-            --report-path gitleaks-report.sarif
+            --report-format json \
+            --report-path gitleaks-report.json
 
-      - name: Upload Report
+      - name: Create Findings Report
+        if: always()
+        run: |
+          if [ -f gitleaks-report.json ]; then
+            jq '[
+              .[] | {
+                rule: .RuleID,
+                file: .File,
+                line: .StartLine,
+                commit: .Commit,
+                author: .Author,
+                description: .Description
+              }
+            ]' gitleaks-report.json > findings.json
+          else
+            echo '[]' > findings.json
+          fi
+
+      - name: Upload Findings
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gitleaks-report
-          path: gitleaks-report.sarif
-          if-no-files-found: ignore
+          name: gitleaks-findings
+          path: findings.json
           retention-days: 30
+
+      - name: Fail if Secrets Found or Scan Failed
+        if: always()
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+        run: |
+          if [ "$SCAN_OUTCOME" != "success" ]; then
+            echo "::error::Gitleaks detected secrets or the scan failed."
+            exit 1
+          fi
